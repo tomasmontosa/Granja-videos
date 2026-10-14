@@ -1,4 +1,11 @@
-import os, json, re, subprocess, tempfile, pathlib, requests
+import os
+import json
+import re
+import subprocess
+import pathlib
+import html
+import requests
+
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -8,6 +15,9 @@ ROOT = pathlib.Path(__file__).parent
 OUT = ROOT / "output"
 OUT.mkdir(exist_ok=True)
 
+COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+USER_AGENT = "YouTubeShortPilot/1.0 (personal educational project; contact via repository owner)"
+
 def run(cmd):
     print("+", " ".join(map(str, cmd)))
     subprocess.run(cmd, check=True)
@@ -15,53 +25,110 @@ def run(cmd):
 def safe_path(p):
     return str(p).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
-def get_stock_video(query, api_key, target):
-    r = requests.get(
-        "https://api.pexels.com/v1/videos/search",
-        headers={"Authorization": api_key},
-        params={"query": query, "orientation": "portrait", "per_page": 10},
-        timeout=30
-    )
+def clean_html(value):
+    value = html.unescape(value or "")
+    value = re.sub(r"<[^>]+>", "", value)
+    return " ".join(value.split()).strip()
+
+def get_stock_video(query, target):
+    # Commons files have individual licenses. Accept only clearly identified CC0,
+    # Public Domain, or CC BY 4.0 files; skip ambiguous and ShareAlike licenses.
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrnamespace": 6,
+        "gsrsearch": f"{query} filetype:video",
+        "gsrlimit": 20,
+        "prop": "imageinfo",
+        "iiprop": "url|mime|size|extmetadata",
+    }
+    r = requests.get(COMMONS_API, params=params,
+                     headers={"User-Agent": USER_AGENT}, timeout=30)
     r.raise_for_status()
-    videos = r.json().get("videos", [])
-    if not videos:
-        raise RuntimeError(f"No Pexels videos found for query: {query}")
-    # Prefer a medium-sized file to reduce render time.
-    files = []
-    for video in videos:
-        for f in video.get("video_files", []):
-            if f.get("file_type") == "video/mp4" and f.get("link"):
-                w, h = f.get("width") or 0, f.get("height") or 0
-                if w and h:
-                    files.append((abs((w/h) - (9/16)), f.get("width", 99999), f["link"], video.get("url",""), video.get("user",{}).get("name","Pexels contributor")))
-    if not files:
-        raise RuntimeError("Pexels returned no usable MP4 files.")
-    files.sort(key=lambda x: (x[0], x[1]))
-    _, _, link, page_url, creator = files[0]
-    with requests.get(link, stream=True, timeout=60) as resp:
+    pages = r.json().get("query", {}).get("pages", {})
+    candidates = []
+
+    for page in pages.values():
+        info_list = page.get("imageinfo", [])
+        if not info_list:
+            continue
+        info = info_list[0]
+        mime = (info.get("mime") or "").lower()
+        if not mime.startswith("video/"):
+            continue
+        size = info.get("size") or 0
+        if size and size > 150 * 1024 * 1024:
+            continue
+
+        meta = info.get("extmetadata", {})
+        license_short = clean_html(meta.get("LicenseShortName", {}).get("value", ""))
+        license_url = clean_html(meta.get("LicenseUrl", {}).get("value", ""))
+        creator = clean_html(meta.get("Artist", {}).get("value", "")) or clean_html(
+            meta.get("Credit", {}).get("value", "")) or "Autor no indicado"
+        title = page.get("title", "Archivo de Wikimedia Commons")
+        source_page = info.get("descriptionurl", "")
+        download_url = info.get("url", "")
+
+        normalized = license_short.lower()
+        allowed = (
+            normalized in {"cc0 1.0", "cc0", "public domain", "public domain mark"}
+            or normalized.startswith("cc by 4.0")
+        )
+        if not allowed or not download_url or not source_page:
+            continue
+
+        candidates.append({
+            "title": title,
+            "creator": creator,
+            "license": license_short,
+            "license_url": license_url,
+            "source_page": source_page,
+            "download_url": download_url,
+            "size": size,
+        })
+
+    if not candidates:
+        raise RuntimeError(
+            f"No encontré videos con licencia CC0, Dominio Público o CC BY 4.0 para: {query}. "
+            "Probá con una búsqueda visual más general."
+        )
+
+    # Use the first suitable result. Keep the file page and license for attribution.
+    chosen = candidates[0]
+    with requests.get(chosen["download_url"], stream=True,
+                      headers={"User-Agent": USER_AGENT}, timeout=90) as resp:
         resp.raise_for_status()
         with open(target, "wb") as f:
-            for chunk in resp.iter_content(1024*1024):
+            for chunk in resp.iter_content(1024 * 1024):
                 if chunk:
                     f.write(chunk)
-    return page_url, creator
 
-def make_video(script, pexels_key):
+    attribution = (
+        f"Material visual: {chosen['title']}\n"
+        f"Autor/crédito: {chosen['creator']}\n"
+        f"Fuente: {chosen['source_page']}\n"
+        f"Licencia: {chosen['license']}"
+        + (f" ({chosen['license_url']})" if chosen["license_url"] else "")
+        + "\nDescargado desde Wikimedia Commons; se aplican los términos de la licencia indicada."
+    )
+    return attribution
+
+def make_video(script):
     slug = re.sub(r"[^a-z0-9]+", "-", script["id"].lower()).strip("-")
     audio = OUT / f"{slug}.mp3"
     srt = OUT / f"{slug}.srt"
-    stock = OUT / f"{slug}-stock.mp4"
+    stock = OUT / f"{slug}-stock"
     video = OUT / f"{slug}.mp4"
 
-    # Use Edge's online TTS service via the open-source edge-tts package.
-    run(["edge-tts", "--voice", script.get("voice", "es-AR-ElenaNeural"),
-         "--text", script["narration"], "--write-media", str(audio),
-         "--write-subtitles", str(srt)])
+    run([
+        "edge-tts", "--voice", script.get("voice", "es-AR-ElenaNeural"),
+        "--text", script["narration"], "--write-media", str(audio),
+        "--write-subtitles", str(srt)
+    ])
 
-    source_url, creator = get_stock_video(script["visual_search"], pexels_key, stock)
+    attribution = get_stock_video(script["visual_search"], stock)
 
-    # Render a vertical 1080x1920 short. The stock video is looped to match narration.
-    # Captions are burned in from the generated SRT. Upload is private by default.
     subtitle_path = safe_path(srt.resolve())
     duration_probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -76,15 +143,17 @@ def make_video(script, pexels_key):
         "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=3,"
         "Shadow=1,Alignment=2,MarginV=170'"
     )
-    run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(stock), "-i", str(audio),
-         "-t", f"{duration:.2f}", "-vf", vf, "-map", "0:v:0", "-map", "1:a:0",
-         "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-         "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p",
-         "-movflags", "+faststart", str(video)])
+    run([
+        "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(stock), "-i", str(audio),
+        "-t", f"{duration:.2f}", "-vf", vf, "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+        "-c:a", "aac", "-b:a", "128k", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", str(video)
+    ])
 
     description = script["description"].strip()
-    description += f"\n\nVisual footage: {source_url} (Pexels; contributor: {creator})."
-    description += "\nThis Short uses original narration and licensed stock footage."
+    description += "\n\n" + attribution
+    description += "\n\nNarración original generada para este video. Revisa la licencia indicada arriba antes de reutilizar el material."
     return video, description
 
 def upload(video_path, script, description):
@@ -130,11 +199,11 @@ def upload(video_path, script, description):
 
 def main():
     script_file = os.environ.get("SCRIPT_FILE", "scripts/sol_desaparece.json")
-    pexels_key = os.environ["PEXELS_API_KEY"]
     with open(ROOT / script_file, encoding="utf-8") as f:
         script = json.load(f)
-    video, description = make_video(script, pexels_key)
+    video, description = make_video(script)
     upload(video, script, description)
 
 if __name__ == "__main__":
     main()
+ 
